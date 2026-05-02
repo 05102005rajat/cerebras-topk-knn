@@ -1,0 +1,63 @@
+// Top-K k-NN — layout.csl
+//
+// P×P PE grid. Each PE owns rows_per_pe rows of D (zero-padded for the last
+// shard if N is not divisible). Query q is broadcast to every PE by the host
+// (via memcpy_h2d to all PEs in the rectangle). Each PE computes squared L2
+// distances vs q, extracts a local top-K, then we reduce: gather along x to
+// the leftmost column, merge → row top-K; gather along y to row 0, merge →
+// global top-K at PE(0,0). Host reads the result back from PE(0,0).
+//
+// Colors / task IDs follow the gemv-collectives_2d convention so we don't
+// collide with memcpy reservations (21,22,23,27,28,29,30,31).
+//
+//   x-axis collective:    colors 0,1   entrypoint task IDs 14,15
+//   y-axis collective:    colors 4,5   entrypoint task IDs 16,17
+//   our callback chain:   task IDs 9,10,11,12 (declared in pe_program.csl)
+
+param P:           u16;   // grid is P × P
+param d_dim:       u16;   // vector dimension
+param rows_per_pe: u16;   // ceil(N / P²)  — host pads last PE with zeros and sets valid_rows
+param K:           u16;   // top-K
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width  = P,
+  .height = P,
+});
+
+const c2d = @import_module("<collectives_2d/params>");
+
+layout {
+  @set_rectangle(P, P);
+
+  var Px: u16 = 0;
+  while (Px < P) : (Px += 1) {
+    const memcpy_params = memcpy.get_params(Px);
+    var Py: u16 = 0;
+    while (Py < P) : (Py += 1) {
+      const c2d_params = c2d.get_params(Px, Py, .{
+        .x_colors      = .{ @get_color(0),         @get_color(1) },
+        .x_entrypoints = .{ @get_local_task_id(14), @get_local_task_id(15) },
+        .y_colors      = .{ @get_color(4),         @get_color(5) },
+        .y_entrypoints = .{ @get_local_task_id(16), @get_local_task_id(17) },
+      });
+      @set_tile_code(Px, Py, "pe_program.csl", .{
+        .memcpy_params = memcpy_params,
+        .c2d_params    = c2d_params,
+        .P             = P,
+        .d_dim         = d_dim,
+        .rows_per_pe   = rows_per_pe,
+        .K             = K,
+      });
+    }
+  }
+
+  // Host-visible symbols. ROW_MAJOR memcpy lays out (h=P, w=P, l=...), so
+  // the flat PE index seen by run.py is py*P + px.
+  @export_name("D_shard",      [*]f32, true);
+  @export_name("q",            [*]f32, true);
+  @export_name("index_offset", [*]u32, true);
+  @export_name("valid_rows",   [*]u32, true);
+  @export_name("final_dist",   [*]f32, true);
+  @export_name("final_idx",    [*]u32, true);
+  @export_name("kernel_main",  fn()void);
+}

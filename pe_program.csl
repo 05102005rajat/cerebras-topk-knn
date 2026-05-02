@@ -1,0 +1,370 @@
+// Top-K k-NN — pe_program.csl
+//
+// Each PE owns rows_per_pe rows of D (zero-padded for the last shard if N is
+// not divisible by P²). Query q is broadcast to every PE by the host. The
+// flow is a chain of tasks, each one fired by the previous collective's
+// callback (the standard gemv-collectives_2d idiom):
+//
+//   kernel_main      — host entry. mpi.init, distance compute, local top-K,
+//                      issue x-gather of dist.
+//   x_dist_done      — issue x-gather of idx.
+//   x_idx_done       — at column 0, merge K·P → row top-K. Issue y-gather
+//                      of dist (every PE participates).
+//   y_dist_done      — issue y-gather of idx.
+//   y_idx_done       — at PE(0,0), merge K·P → global top-K. Every PE
+//                      unblocks the cmd stream so runner.launch() returns.
+//
+// Cols 1..P-1 do "useless" y-gathers whose data we never read — they run on
+// disjoint y-fabric routes in parallel with col 0's gather, so cost no
+// added latency. Avoiding the per-column branch keeps every PE on the same
+// SPMD task chain (collectives_2d will deadlock if some PEs in a column
+// skip a collective the others called).
+
+param memcpy_params;
+param c2d_params;
+
+param P:           u16;
+param d_dim:       u16;
+param rows_per_pe: u16;
+param K:           u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// Distinct queue/DSR IDs for x and y so the two collectives don't collide
+// on shared resources (pattern from gemm-collectives_2d / topic-11).
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+  .dim_params    = c2d_params.x,
+  .queues        = [2]u16{2, 4},
+  .dest_dsr_ids  = [1]u16{1},
+  .src0_dsr_ids  = [1]u16{1},
+  .src1_dsr_ids  = [1]u16{1},
+});
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+  .dim_params    = c2d_params.y,
+  .queues        = [2]u16{3, 5},
+  .dest_dsr_ids  = [1]u16{2},
+  .src0_dsr_ids  = [1]u16{2},
+  .src1_dsr_ids  = [1]u16{2},
+});
+
+// Callback task IDs. Memcpy reserves 21,22,23,27,28,29,30,31; collectives_2d
+// uses 14,15,16,17 (configured in layout.csl). 8–13 are free.
+const x_dist_done_task_id: local_task_id = @get_local_task_id(9);
+const x_idx_done_task_id:  local_task_id = @get_local_task_id(10);
+const y_dist_done_task_id: local_task_id = @get_local_task_id(11);
+const y_idx_done_task_id:  local_task_id = @get_local_task_id(12);
+
+// Sentinel pair for padded rows on the last shard of an uneven workload.
+// Squared distances fit comfortably under 1e30 for the test workloads
+// (d ≤ 32, N(0,1) entries → max squared distance well under 1e3).
+const INF:    f32 = 3.4028234e38;
+const U32MAX: u32 = 4294967295;
+
+const KP: u16 = K * P;
+
+// ---------------------------------------------------------------- buffers ----
+
+// Host-filled (memcpy_h2d).
+var D_shard          = @zeros([rows_per_pe * d_dim]f32);
+var q                = @zeros([d_dim]f32);
+var index_offset_arr = @zeros([1]u32);
+var valid_rows_arr   = @zeros([1]u32);
+
+// Per-row distance + global index, before top-K extraction.
+var dist_buf    = @zeros([rows_per_pe]f32);
+var idx_buf     = @zeros([rows_per_pe]u32);
+var scratch_buf = @zeros([rows_per_pe]f32);
+
+// Local top-K, then row top-K (written in-place at column 0 between gathers).
+var local_top_dist = @zeros([K]f32);
+var local_top_idx  = @zeros([K]u32);
+
+// Gather destinations.
+var row_gather_dist = @zeros([KP]f32);
+var row_gather_idx  = @zeros([KP]u32);
+var col_gather_dist = @zeros([KP]f32);
+var col_gather_idx  = @zeros([KP]u32);
+
+// Final result — only meaningful at PE(0,0); host reads from that PE.
+var final_dist = @zeros([K]f32);
+var final_idx  = @zeros([K]u32);
+
+// Pointers exported to the host.
+var ptr_D:          [*]f32 = &D_shard;
+var ptr_q:          [*]f32 = &q;
+var ptr_offset:     [*]u32 = &index_offset_arr;
+var ptr_valid:      [*]u32 = &valid_rows_arr;
+var ptr_final_dist: [*]f32 = &final_dist;
+var ptr_final_idx:  [*]u32 = &final_idx;
+
+// DSDs over the per-PE row dimension. Used by the distance loop, which
+// vectorizes over `rows_per_pe` lanes for each input dimension j.
+const dist_dsd    = @get_dsd(mem1d_dsd, .{ .tensor_access = |r|{rows_per_pe} -> dist_buf[r]    });
+const scratch_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |r|{rows_per_pe} -> scratch_buf[r] });
+
+// Base DSD into D_shard. Stride d_dim, so lane r addresses D_shard[r * d_dim].
+// Per-iteration we'll get D_shard[r * d_dim + j] via @increment_dsd_offset.
+// Mixed-type multiply needs the cast — see gemv-collectives_2d/pe.csl.
+const D_base_dsd = @get_dsd(mem1d_dsd, .{
+  .tensor_access = |r|{rows_per_pe} -> D_shard[r * @as(i16, d_dim)],
+});
+
+// PE coordinates within the kernel rectangle, populated in kernel_main.
+var px: u16 = 0;
+var py: u16 = 0;
+
+// ---------------------------------------------------------------- helpers ----
+
+// Total order on (distance, original-index) pairs. Smaller distance wins;
+// ties broken by smaller original index. Used everywhere we compare two
+// candidates so the merge result is independent of input order.
+fn lex_lt(a_d: f32, a_i: u32, b_d: f32, b_i: u32) bool {
+  if (a_d < b_d) return true;
+  if (a_d > b_d) return false;
+  return a_i < b_i;
+}
+
+// Sift element at `root` down a max-heap of `size` elements stored in two
+// parallel arrays (distances + indices). Standard textbook sift_down: at
+// each step, swap with the larger child until the heap property holds.
+fn sift_down(buf_d: [*]f32, buf_i: [*]u32, root: u16, size: u16) void {
+  var i: u16 = root;
+  while (true) {
+    const l: u16 = 2 * i + 1;
+    if (l >= size) break;
+    var max_pos: u16 = i;
+    if (lex_lt(buf_d[max_pos], buf_i[max_pos], buf_d[l], buf_i[l])) {
+      max_pos = l;
+    }
+    const r: u16 = l + 1;
+    if (r < size) {
+      if (lex_lt(buf_d[max_pos], buf_i[max_pos], buf_d[r], buf_i[r])) {
+        max_pos = r;
+      }
+    }
+    if (max_pos == i) break;
+    const td: f32 = buf_d[i];
+    const ti: u32 = buf_i[i];
+    buf_d[i]       = buf_d[max_pos];
+    buf_i[i]       = buf_i[max_pos];
+    buf_d[max_pos] = td;
+    buf_i[max_pos] = ti;
+    i = max_pos;
+  }
+}
+
+// P-way merge of P pre-sorted runs of length K each. Used at the row and
+// final merge stages, where every contributor's K-element block is already
+// ascending in lex order (output of `topk_select`'s heapsort). Linear-min
+// over P heads per pop; P is small (≤ 4 in our cases) so a tournament tree
+// would be marginal. K total pops, O(K·P) total compares.
+fn merge_sorted_runs(
+  in_d:  [*]f32,
+  in_i:  [*]u32,
+  out_d: [*]f32,
+  out_i: [*]u32,
+) void {
+  var head: [P]u16 = @zeros([P]u16);
+  for (@range(u16, K)) |k| {
+    var best: u16 = P;          // sentinel "no run picked yet"
+    var best_d: f32 = INF;
+    var best_i: u32 = U32MAX;
+    for (@range(u16, P)) |p| {
+      if (head[p] < K) {
+        const off: u16 = p * K + head[p];
+        const cd: f32 = in_d[off];
+        const ci: u32 = in_i[off];
+        if (best == P or lex_lt(cd, ci, best_d, best_i)) {
+          best   = p;
+          best_d = cd;
+          best_i = ci;
+        }
+      }
+    }
+    out_d[k] = best_d;
+    out_i[k] = best_i;
+    head[best] += 1;
+  }
+}
+
+// Top-K via max-heap of size K, then heapsort to ascending order.
+//
+//   - Init heap with first K elements of `in_*`.
+//   - Heapify: sift_down from K/2-1 down to 0. O(K).
+//   - For each remaining element, replace the heap root if it wins lex
+//     order. O(log K) per replacement, much less for skipped elements.
+//   - Heapsort the heap into ascending order. O(K log K).
+//
+// Total O((in_size − K) · log K + K · log K). For random inputs the heap
+// stops being touched quickly because the threshold tightens.
+//
+// `in_*` and `out_*` must be disjoint (we read in[K..in_size) while writing
+// out[0..K)).
+fn topk_select(
+  in_d:    [*]f32,
+  in_i:    [*]u32,
+  in_size: u16,
+  out_d:   [*]f32,
+  out_i:   [*]u32,
+) void {
+  // Initialise heap with the first K elements.
+  for (@range(u16, K)) |k| {
+    out_d[k] = in_d[k];
+    out_i[k] = in_i[k];
+  }
+
+  // Heapify: K/2-1 down to 0. Iterate `ip1` from K/2 down to 1 to dodge u16
+  // underflow when K is small.
+  var ip1: u16 = K / 2;
+  while (ip1 > 0) : (ip1 -= 1) {
+    sift_down(out_d, out_i, ip1 - 1, K);
+  }
+
+  // Process the rest. Replace the root only if the new element wins lex.
+  var r: u16 = K;
+  while (r < in_size) : (r += 1) {
+    const dr: f32 = in_d[r];
+    const ir: u32 = in_i[r];
+    if (lex_lt(dr, ir, out_d[0], out_i[0])) {
+      out_d[0] = dr;
+      out_i[0] = ir;
+      sift_down(out_d, out_i, 0, K);
+    }
+  }
+
+  // Heapsort: repeatedly swap root with last element of the heap, then
+  // sift_down on the shrunken heap. With a max-heap this leaves the array
+  // sorted in ascending order (largest at the back, smallest at the front).
+  var size: u16 = K;
+  while (size > 1) : (size -= 1) {
+    const last: u16 = size - 1;
+    const td: f32 = out_d[0];
+    const ti: u32 = out_i[0];
+    out_d[0]    = out_d[last];
+    out_i[0]    = out_i[last];
+    out_d[last] = td;
+    out_i[last] = ti;
+    sift_down(out_d, out_i, 0, last);
+  }
+}
+
+// Compute squared L2 distance per row via a (j, r) loop nest so we can
+// vectorize across `rows_per_pe` lanes for each j. Three DSD ops per j:
+//
+//   scratch[r] = D[r,j] - q[j]              (fsubs DSD - scalar)
+//   scratch[r] = scratch[r] · scratch[r]    (fmuls DSD · DSD)
+//   dist[r]   += scratch[r]                 (fadds DSD + DSD)
+//
+// Then tag each row with its global index, or rewrite padded rows with the
+// (INF, U32MAX) sentinel so they sort to the back.
+fn compute_distances() void {
+  for (@range(i16, d_dim)) |j| {
+    const D_col_dsd = @increment_dsd_offset(D_base_dsd, j, f32);
+    @fsubs(scratch_dsd, D_col_dsd, q[j]);
+    @fmuls(scratch_dsd, scratch_dsd, scratch_dsd);
+    @fadds(dist_dsd,    dist_dsd,    scratch_dsd);
+  }
+
+  const offset: u32 = index_offset_arr[0];
+  const valid:  u32 = valid_rows_arr[0];
+  for (@range(u16, rows_per_pe)) |r| {
+    if (@as(u32, r) < valid) {
+      idx_buf[r] = offset + @as(u32, r);
+    } else {
+      dist_buf[r] = INF;
+      idx_buf[r]  = U32MAX;
+    }
+  }
+}
+
+// ----------------------------------------------------------- task chain ----
+
+// Host entry: PE init, local distances, local top-K, kick off x-gather of
+// distances. The idx x-gather follows in `x_dist_done`.
+fn kernel_main() void {
+  mpi_x.init();
+  mpi_y.init();
+  px = mpi_x.pe_id;
+  py = mpi_y.pe_id;
+
+  compute_distances();
+  topk_select(
+    @ptrcast([*]f32, &dist_buf),
+    @ptrcast([*]u32, &idx_buf),
+    rows_per_pe,
+    @ptrcast([*]f32, &local_top_dist),
+    @ptrcast([*]u32, &local_top_idx),
+  );
+
+  mpi_x.gather(0,
+    @ptrcast([*]u32, &local_top_dist),
+    @ptrcast([*]u32, &row_gather_dist),
+    K, x_dist_done_task_id);
+}
+
+// First x-gather (dist) done. Send the matching indices.
+task x_dist_done() void {
+  mpi_x.gather(0,
+    @ptrcast([*]u32, &local_top_idx),
+    @ptrcast([*]u32, &row_gather_idx),
+    K, x_idx_done_task_id);
+}
+
+// Both x-gathers done: PE(0, py) holds K·P candidates from its row,
+// arranged as P concatenated ascending runs of K. P-way merge picks the K
+// smallest in lex order — much cheaper than re-heaping the K·P input.
+// Merge result goes back into local_top_* so the next gather sends it.
+task x_idx_done() void {
+  if (px == 0) {
+    merge_sorted_runs(
+      @ptrcast([*]f32, &row_gather_dist),
+      @ptrcast([*]u32, &row_gather_idx),
+      @ptrcast([*]f32, &local_top_dist),
+      @ptrcast([*]u32, &local_top_idx),
+    );
+  }
+
+  mpi_y.gather(0,
+    @ptrcast([*]u32, &local_top_dist),
+    @ptrcast([*]u32, &col_gather_dist),
+    K, y_dist_done_task_id);
+}
+
+// First y-gather (dist) done. Send the matching indices.
+task y_dist_done() void {
+  mpi_y.gather(0,
+    @ptrcast([*]u32, &local_top_idx),
+    @ptrcast([*]u32, &col_gather_idx),
+    K, y_idx_done_task_id);
+}
+
+// Both y-gathers done: PE(0,0) holds row-merged top-Ks from every row in
+// column 0, arranged as P concatenated ascending runs of K. P-way merge
+// gives the global top-K. Every PE must unblock the cmd stream or
+// runner.launch() never returns.
+task y_idx_done() void {
+  if (px == 0 and py == 0) {
+    merge_sorted_runs(
+      @ptrcast([*]f32, &col_gather_dist),
+      @ptrcast([*]u32, &col_gather_idx),
+      @ptrcast([*]f32, &final_dist),
+      @ptrcast([*]u32, &final_idx),
+    );
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @bind_local_task(x_dist_done, x_dist_done_task_id);
+  @bind_local_task(x_idx_done,  x_idx_done_task_id);
+  @bind_local_task(y_dist_done, y_dist_done_task_id);
+  @bind_local_task(y_idx_done,  y_idx_done_task_id);
+
+  @export_symbol(ptr_D,          "D_shard");
+  @export_symbol(ptr_q,          "q");
+  @export_symbol(ptr_offset,     "index_offset");
+  @export_symbol(ptr_valid,      "valid_rows");
+  @export_symbol(ptr_final_dist, "final_dist");
+  @export_symbol(ptr_final_idx,  "final_idx");
+  @export_symbol(kernel_main);
+}
