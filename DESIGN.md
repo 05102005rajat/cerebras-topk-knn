@@ -60,9 +60,10 @@ in the merge stage.
 ascending K-element block, so the row-merge input is `P` concatenated
 sorted runs of length `K`. We do a P-way linear-min merge: `K` pops, each
 scans the `P` heads and advances one. **O(K · P)** vs. O((K·P) · log K) for
-re-heaping the K·P input. Gains scale with K — for `k_large` (K=256, P=2)
-this is ~24× fewer compares per merge stage; the row-merge alone drops
-from ~6k compares to ~512.
+re-heaping the K·P input — a ratio of `log K` in the algorithm's favor.
+Gains scale with K — for `k_large` (K=256, P=2), log₂K = 8, so this is
+~8× fewer compares per merge stage; the row-merge alone drops from
+~4k compares (512 · 8) to ~512.
 
 ## 3. Fabric bandwidth accounting
 
