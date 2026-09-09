@@ -12,6 +12,23 @@ fabric with zero host involvement between input load and output readback.
 **Start time:** 2026-04-29 (logged per SPEC §7; challenge is time-boxed to 72
 hours). Submitted 2026-05-01.
 
+| | |
+|---|---|
+| **Challenge result** | one of ~49 perfect-passing kernels out of 1,000+ submissions |
+| **Local top-K** | ~32x fewer element ops than selection sort (K=256 case) |
+| **Fabric reduction** | ~8x fewer compares than re-heaping |
+| **Time box** | 72 hours, start time logged per spec |
+
+## Why I built it
+
+The Cerebras Kernel Challenge, a timed take-home in their technical hiring loop.
+I took it because I wanted to write code at a level where moving data between
+processing elements is the actual problem rather than something a runtime hides.
+
+On a wafer-scale engine you cannot fall back on a library call. The database is
+sharded across a grid of PEs, each PE only sees its own shard, and the reduction
+across the fabric is yours to design. That constraint is the whole appeal.
+
 ## Key results
 
 - **Local top-K, ~32× fewer element-ops than selection sort.** Extraction
